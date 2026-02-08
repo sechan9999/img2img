@@ -1,0 +1,9 @@
+﻿.claude.json
+.claude.json.backup.*
+__pycache__/
+*.pyc
+sd_database.db
+sd_server.log
+generated_images/
+batch_generated/
+.env
