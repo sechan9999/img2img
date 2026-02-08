@@ -31,6 +31,9 @@ from pydantic import BaseModel, Field, field_validator
 from diffusers import (
     DiffusionPipeline,
     StableDiffusionImg2ImgPipeline,
+    DPMSolverMultistepScheduler,
+    EulerAncestralDiscreteScheduler,
+    LCMScheduler
 )
 
 # Scheduling
@@ -187,9 +190,15 @@ STYLE_PRESETS = {
     },
     "vintage": {
         "name": "vintage",
-        "description": "빈티지/레트로 스타일",
-        "prompt_suffix": "vintage style, retro aesthetic, film grain, warm tones, nostalgic",
-        "negative_prompt": "modern, digital, clean, low quality"
+        "description": "빈티지 필름 스타일",
+        "prompt_suffix": "vintage film, grainy, analog photography, 1980s style, washed out colors, polaroid",
+        "negative_prompt": "digital, sharp, modern, high contrast, clean"
+    },
+    "lcm": {
+        "name": "lcm (Fast Mode)",
+        "description": "초고속 생성 모드 (4-8 Steps)",
+        "prompt_suffix": "high quality, detailed, realistic, 8k",
+        "negative_prompt": "blurry, low quality, pixelated"
     }
 }
 
@@ -423,6 +432,17 @@ async def lifespan(app: FastAPI):
             requires_safety_checker=False
         ).to("cuda")
         
+        # LCM LoRA 로딩 (속도 최적화)
+        logger.info("⚡ LCM LoRA 로딩 중... (최초 실행 시 시간 소요)")
+        try:
+            # LCM LoRA 로드 (adapter_name='lcm'으로 관리)
+            pipe_text2img.load_lora_weights("latent-consistency/lcm-lora-sdv1-5", adapter_name="lcm")
+            # 기본적으로 LoRA 비활성화 (일반 모드 유지를 위해)
+            pipe_text2img.disable_lora()
+            logger.info("✅ LCM LoRA 로딩 완료!")
+        except Exception as e:
+            logger.warning(f"⚠️ LCM LoRA 로딩 실패 (인터넷 연결 확인): {e}")
+        
         logger.info("✅ 모델 로딩 완료!")
         
         if torch.cuda.is_available():
@@ -596,17 +616,40 @@ def generate_text2img(request: Text2ImgRequest, db: Session = Depends(get_db)):
             actual_seed = torch.randint(0, 2**32 - 1, (1,)).item()
         generator = torch.Generator("cuda").manual_seed(actual_seed)
         
-        # 이미지 생성
-        with torch.inference_mode():
-            image = pipe_text2img(
-                prompt=enhanced_prompt,
-                negative_prompt=enhanced_negative,
-                num_inference_steps=request.steps,
-                guidance_scale=request.guidance_scale,
-                width=request.width,
-                height=request.height,
-                generator=generator
-            ).images[0]
+        # ⚡ LCM 모드 체크 (Steps <= 10 또는 style == 'lcm')
+        is_lcm_mode = (request.steps <= 10) or (request.style == "lcm")
+        original_scheduler = pipe_text2img.scheduler
+        
+        try:
+            if is_lcm_mode:
+                # LCM 설정
+                pipe_text2img.scheduler = LCMScheduler.from_config(pipe_text2img.scheduler.config)
+                pipe_text2img.enable_lora()
+                
+                # LCM 최적화 파라미터
+                run_steps = 4 if request.style == "lcm" else request.steps
+                run_guidance = 1.2 if request.style == "lcm" else min(request.guidance_scale, 2.0)
+            else:
+                # 일반 모드
+                run_steps = request.steps
+                run_guidance = request.guidance_scale
+        
+            # 이미지 생성
+            with torch.inference_mode():
+                image = pipe_text2img(
+                    prompt=enhanced_prompt,
+                    negative_prompt=enhanced_negative,
+                    num_inference_steps=run_steps,
+                    guidance_scale=run_guidance,
+                    width=request.width,
+                    height=request.height,
+                    generator=generator
+                ).images[0]
+        finally:
+            # 상태 복구 (다음 요청을 위해)
+            if is_lcm_mode:
+                pipe_text2img.scheduler = original_scheduler
+                pipe_text2img.disable_lora()
         
         # 생성 시간 계산
         generation_time = (datetime.now() - start_time).total_seconds()
@@ -692,17 +735,38 @@ async def generate_img2img(
             actual_seed = torch.randint(0, 2**32 - 1, (1,)).item()
         generator = torch.Generator("cuda").manual_seed(actual_seed)
         
-        # 이미지 생성
-        with torch.inference_mode():
-            result_image = pipe_img2img(
-                prompt=enhanced_prompt,
-                negative_prompt=enhanced_negative,
-                image=init_image,
-                strength=strength,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                generator=generator
-            ).images[0]
+        # ⚡ LCM 모드 체크
+        is_lcm_mode = (steps <= 10) or (style == "lcm")
+        original_scheduler = pipe_img2img.scheduler
+        
+        try:
+            if is_lcm_mode:
+                pipe_img2img.scheduler = LCMScheduler.from_config(original_scheduler.config)
+                # Text2Img 파이프라인을 통해 LoRA 활성화 (UNet 공유)
+                pipe_text2img.enable_lora()
+                
+                run_steps = 4 if style == "lcm" else steps
+                run_guidance = 1.2 if style == "lcm" else min(guidance_scale, 2.0)
+            else:
+                # 일반 모드
+                run_steps = steps
+                run_guidance = guidance_scale
+                
+            # 이미지 생성
+            with torch.inference_mode():
+                result_image = pipe_img2img(
+                    prompt=enhanced_prompt,
+                    negative_prompt=enhanced_negative,
+                    image=init_image,
+                    strength=strength,
+                    num_inference_steps=run_steps,
+                    guidance_scale=run_guidance,
+                    generator=generator
+                ).images[0]
+        finally:
+            if is_lcm_mode:
+                pipe_img2img.scheduler = original_scheduler
+                pipe_text2img.disable_lora()
         
         # 생성 시간 계산
         generation_time = (datetime.now() - start_time).total_seconds()

@@ -45,6 +45,12 @@ pandas>=2.0.0
 numpy>=1.24.0
 
 # ====================
+# UI 및 최적화
+# ====================
+gradio>=4.0.0
+peft>=0.7.0
+
+# ====================
 # PyTorch 설치 명령어 (CUDA 12.1)
 # ====================
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
